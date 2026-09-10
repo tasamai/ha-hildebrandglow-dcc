@@ -223,6 +223,15 @@ async def _async_import_resource(hass: HomeAssistant, resource, virtual_entity) 
     readings = await _async_fetch_half_hourly(hass, resource, t_from, t_to)
     buckets = _bucket_into_complete_hours(readings, is_cost)
     if not buckets:
+        _LOGGER.info(
+            "No complete hours to import for %s (%s): got %s half-hourly readings "
+            "between %s and %s",
+            resource.classifier,
+            statistic_id,
+            len(readings),
+            t_from,
+            t_to,
+        )
         return
 
     statistics: list[StatisticData] = []
@@ -231,7 +240,7 @@ async def _async_import_resource(hass: HomeAssistant, resource, virtual_entity) 
         statistics.append(StatisticData(start=hour_start, state=value, sum=running_sum))
 
     async_add_external_statistics(hass, metadata, statistics)
-    _LOGGER.debug(
+    _LOGGER.info(
         "Imported %s hourly statistics for %s (%s)",
         len(statistics),
         resource.classifier,
