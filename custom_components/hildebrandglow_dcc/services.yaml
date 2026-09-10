@@ -1,0 +1,19 @@
+backfill_statistics:
+  name: Backfill statistics
+  description: >-
+    Re-fetch half-hourly usage/cost readings for every configured account and
+    (re)import them as long-term statistics. Safe to run repeatedly - existing
+    hours are updated in place, not duplicated. Useful for pulling in data the
+    smart meter reported late, or for a one-off historical import.
+  fields:
+    days:
+      name: Days
+      description: How many days back to backfill, from today.
+      example: 365
+      default: 365
+      selector:
+        number:
+          min: 1
+          max: 3650
+          unit_of_measurement: days
+          mode: box

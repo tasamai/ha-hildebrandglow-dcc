@@ -9,11 +9,15 @@ actually has it, with no persisted "last imported" cursor required.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 import logging
 
 import requests
 
+from homeassistant.components.persistent_notification import (
+    async_create as async_notify,
+)
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import (
     StatisticData,
@@ -41,6 +45,13 @@ STATISTICS_UPDATE_INTERVAL = timedelta(hours=1)
 # Give the initial sensor platform setup (which hits the same API for every
 # resource's "today" totals) time to finish before we add our own requests.
 INITIAL_IMPORT_DELAY = timedelta(seconds=90)
+
+# The Glow API caps PT30M readings requests at 10 days per call; stay a day
+# under that for safety margin. Manual/service backfills chunk into windows
+# of this size, pausing briefly between chunks to avoid hammering the API.
+MAX_PT30M_CHUNK = timedelta(days=9)
+BACKFILL_CHUNK_DELAY_SECONDS = 1
+DEFAULT_BACKFILL_DAYS = 365
 
 CONSUMPTION_CLASSIFIERS = {"electricity.consumption", "gas.consumption"}
 COST_CLASSIFIERS = {"electricity.consumption.cost", "gas.consumption.cost"}
@@ -125,10 +136,12 @@ async def _async_get_baseline(
     return window_start, baseline
 
 
-async def _async_fetch_half_hourly(hass: HomeAssistant, resource, t_from, t_to):
-    """Fetch half-hourly readings for a resource, or [] on failure."""
-    # Tell Hildebrand to pull the latest DCC data before asking for readings,
-    # matching daily_data()'s pattern - non-fatal if it fails.
+async def _async_catchup(hass: HomeAssistant, resource) -> None:
+    """Tell Hildebrand to pull the latest DCC data for a resource.
+
+    Matches daily_data()'s pattern - non-fatal if it fails. Only meaningful
+    once per resource per run, not once per historical chunk.
+    """
     try:
         await hass.async_add_executor_job(resource.catchup)
     except requests.Timeout as ex:
@@ -146,6 +159,9 @@ async def _async_fetch_half_hourly(hass: HomeAssistant, resource, t_from, t_to):
         else:
             _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
 
+
+async def _async_fetch_half_hourly(hass: HomeAssistant, resource, t_from, t_to):
+    """Fetch half-hourly readings for a resource, or [] on failure."""
     try:
         readings = await hass.async_add_executor_job(
             resource.get_readings, t_from, t_to, "PT30M", "sum", True
@@ -200,67 +216,111 @@ def _bucket_into_complete_hours(
     return buckets
 
 
-async def _async_import_resource(hass: HomeAssistant, resource, virtual_entity) -> None:
-    """Backfill statistics for a single resource."""
+def _local_bound(when: datetime) -> datetime:
+    """Convert a tz-aware UTC datetime to the naive-local, whole-second form
+    the Glow API accepts for from/to (see the isoformat() note above)."""
+    return dt_util.as_local(when).replace(tzinfo=None, second=0, microsecond=0)
+
+
+async def _async_import_resource(
+    hass: HomeAssistant, resource, virtual_entity, lookback: timedelta
+) -> int:
+    """Backfill statistics for a single resource over the given lookback window.
+
+    Chunks the request into MAX_PT30M_CHUNK-sized windows (the Glow API's
+    PT30M range limit), walking forward from the baseline so the cumulative
+    sum stays continuous across chunks. Returns the number of hourly
+    statistics rows written.
+    """
     statistic_id = _statistic_id(resource)
     metadata = _metadata_for(resource, _name_for(resource, virtual_entity))
     is_cost = resource.classifier in COST_CLASSIFIERS
 
-    window_start = dt_util.utcnow().replace(
-        minute=0, second=0, microsecond=0
-    ) - STATISTICS_LOOKBACK
-    fetch_start, running_sum = await _async_get_baseline(
+    window_start = (
+        dt_util.utcnow().replace(minute=0, second=0, microsecond=0) - lookback
+    )
+    chunk_start, running_sum = await _async_get_baseline(
         hass, statistic_id, window_start
     )
+    end = dt_util.utcnow().replace(second=0, microsecond=0)
 
-    # pyglowmarkt's time_string() sends isoformat() verbatim (fractional seconds
-    # included), but the Glow API only documents yyyy-mm-ddThh:mm:ss (no
-    # fraction) for from/to - a raw datetime.now() here gets rejected. Strip
-    # to whole seconds, matching daily_data()'s working PT1M-rounded t_to.
-    t_from = dt_util.as_local(fetch_start).replace(tzinfo=None, second=0, microsecond=0)
-    t_to = datetime.now().replace(microsecond=0)
+    await _async_catchup(hass, resource)
 
-    readings = await _async_fetch_half_hourly(hass, resource, t_from, t_to)
-    buckets = _bucket_into_complete_hours(readings, is_cost)
-    if not buckets:
-        _LOGGER.info(
-            "No complete hours to import for %s (%s): got %s half-hourly readings "
-            "between %s and %s",
-            resource.classifier,
-            statistic_id,
-            len(readings),
-            t_from,
-            t_to,
-        )
-        return
+    total_imported = 0
+    while chunk_start < end:
+        chunk_end = min(chunk_start + MAX_PT30M_CHUNK, end)
+        t_from = _local_bound(chunk_start)
+        t_to = _local_bound(chunk_end)
 
-    statistics: list[StatisticData] = []
-    for hour_start, value in buckets:
-        running_sum += value
-        statistics.append(StatisticData(start=hour_start, state=value, sum=running_sum))
+        readings = await _async_fetch_half_hourly(hass, resource, t_from, t_to)
+        buckets = _bucket_into_complete_hours(readings, is_cost)
 
-    async_add_external_statistics(hass, metadata, statistics)
+        if buckets:
+            statistics: list[StatisticData] = []
+            for hour_start, value in buckets:
+                running_sum += value
+                statistics.append(
+                    StatisticData(start=hour_start, state=value, sum=running_sum)
+                )
+            async_add_external_statistics(hass, metadata, statistics)
+            total_imported += len(statistics)
+
+        chunk_start = chunk_end
+        if chunk_start < end:
+            await asyncio.sleep(BACKFILL_CHUNK_DELAY_SECONDS)
+
     _LOGGER.info(
-        "Imported %s hourly statistics for %s (%s)",
-        len(statistics),
+        "Imported %s hourly statistics for %s (%s) over the last %s",
+        total_imported,
         resource.classifier,
         statistic_id,
+        lookback,
     )
+    return total_imported
 
 
-async def _async_import_all(hass: HomeAssistant, glowmarkt) -> None:
-    """Backfill statistics for every usage/cost resource on the account."""
+async def _async_import_all(
+    hass: HomeAssistant, glowmarkt, lookback: timedelta = STATISTICS_LOOKBACK
+) -> int:
+    """Backfill statistics for every usage/cost resource on the account.
+
+    Returns the total number of hourly statistics rows written.
+    """
+    total_imported = 0
     for resource, virtual_entity in await async_get_resource_pairs(hass, glowmarkt):
         if resource.classifier not in STATISTICS_CLASSIFIERS:
             continue
         try:
-            await _async_import_resource(hass, resource, virtual_entity)
+            total_imported += await _async_import_resource(
+                hass, resource, virtual_entity, lookback
+            )
         except Exception:  # pylint: disable=broad-except
             _LOGGER.exception(
                 "Unexpected error importing statistics for %s (%s). Please open an issue",
                 resource.classifier,
                 resource.id,
             )
+    return total_imported
+
+
+async def async_backfill_account(
+    hass: HomeAssistant, glowmarkt, days: int = DEFAULT_BACKFILL_DAYS
+) -> int:
+    """Manually backfill statistics for an account over the given number of days.
+
+    Used by the backfill_statistics service and the button entity. Posts a
+    persistent notification with the result, since this can take a while.
+    """
+    total_imported = await _async_import_all(
+        hass, glowmarkt, lookback=timedelta(days=days)
+    )
+    async_notify(
+        hass,
+        f"Imported {total_imported} hourly statistics from the last {days} days.",
+        title="Hildebrand Glow (DCC) backfill complete",
+        notification_id=f"{DOMAIN}_backfill",
+    )
+    return total_imported
 
 
 async def async_setup_statistics_import(
