@@ -213,8 +213,12 @@ async def _async_import_resource(hass: HomeAssistant, resource, virtual_entity) 
         hass, statistic_id, window_start
     )
 
-    t_from = dt_util.as_local(fetch_start).replace(tzinfo=None)
-    t_to = datetime.now()
+    # pyglowmarkt's time_string() sends isoformat() verbatim (fractional seconds
+    # included), but the Glow API only documents yyyy-mm-ddThh:mm:ss (no
+    # fraction) for from/to - a raw datetime.now() here gets rejected. Strip
+    # to whole seconds, matching daily_data()'s working PT1M-rounded t_to.
+    t_from = dt_util.as_local(fetch_start).replace(tzinfo=None, second=0, microsecond=0)
+    t_to = datetime.now().replace(microsecond=0)
 
     readings = await _async_fetch_half_hourly(hass, resource, t_from, t_to)
     buckets = _bucket_into_complete_hours(readings, is_cost)
