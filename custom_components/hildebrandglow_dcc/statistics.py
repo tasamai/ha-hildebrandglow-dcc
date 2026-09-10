@@ -27,7 +27,7 @@ from homeassistant.components.recorder.statistics import (
 )
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 import homeassistant.util.dt as dt_util
 from homeassistant.util.unit_conversion import EnergyConverter
 
@@ -38,6 +38,9 @@ _LOGGER = logging.getLogger(__name__)
 
 STATISTICS_LOOKBACK = timedelta(days=7)
 STATISTICS_UPDATE_INTERVAL = timedelta(hours=1)
+# Give the initial sensor platform setup (which hits the same API for every
+# resource's "today" totals) time to finish before we add our own requests.
+INITIAL_IMPORT_DELAY = timedelta(seconds=90)
 
 CONSUMPTION_CLASSIFIERS = {"electricity.consumption", "gas.consumption"}
 COST_CLASSIFIERS = {"electricity.consumption.cost", "gas.consumption.cost"}
@@ -268,6 +271,11 @@ async def async_setup_statistics_import(
     async def _run(_now: datetime | None = None) -> None:
         await _async_import_all(hass, glowmarkt)
 
-    hass.async_create_task(_run())
+    unsub_interval = async_track_time_interval(hass, _run, STATISTICS_UPDATE_INTERVAL)
+    unsub_initial = async_call_later(hass, INITIAL_IMPORT_DELAY, _run)
 
-    return async_track_time_interval(hass, _run, STATISTICS_UPDATE_INTERVAL)
+    def _unsub() -> None:
+        unsub_interval()
+        unsub_initial()
+
+    return _unsub
