@@ -124,7 +124,32 @@ async def _async_get_baseline(
 
 async def _async_fetch_half_hourly(hass: HomeAssistant, resource, t_from, t_to):
     """Fetch half-hourly readings for a resource, or [] on failure."""
+    # Tell Hildebrand to pull the latest DCC data before asking for readings,
+    # matching daily_data()'s pattern - non-fatal if it fails.
     try:
+        await hass.async_add_executor_job(resource.catchup)
+    except requests.Timeout as ex:
+        _LOGGER.error("Timeout: %s", ex)
+    except requests.exceptions.ConnectionError as ex:
+        _LOGGER.error("Cannot connect: %s", ex)
+    # Can't use the RuntimeError exception from the library as it's not a subclass of Exception
+    except Exception as ex:  # pylint: disable=broad-except
+        if "Request failed" in str(ex):
+            _LOGGER.debug("Catchup exception detail: %s", ex)
+            _LOGGER.warning(
+                "Non-200 Status Code on catchup. The Glow API may be experiencing "
+                "issues"
+            )
+        else:
+            _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
+
+    try:
+        _LOGGER.debug(
+            "Get half-hourly readings from %s to %s for %s",
+            t_from,
+            t_to,
+            resource.classifier,
+        )
         readings = await hass.async_add_executor_job(
             resource.get_readings, t_from, t_to, "PT30M", "sum", True
         )
@@ -143,6 +168,7 @@ async def _async_fetch_half_hourly(hass: HomeAssistant, resource, t_from, t_to):
     # Can't use the RuntimeError exception from the library as it's not a subclass of Exception
     except Exception as ex:  # pylint: disable=broad-except
         if "Request failed" in str(ex):
+            _LOGGER.debug("Readings exception detail: %s", ex)
             _LOGGER.warning(
                 "Non-200 Status Code. The Glow API may be experiencing issues"
             )
