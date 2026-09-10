@@ -147,6 +147,15 @@ async def daily_data(hass: HomeAssistant, resource) -> float:
         _LOGGER.debug(
             "Readings for %s has %s entries", resource.classifier, len(readings)
         )
+        if not readings:
+            _LOGGER.debug(
+                "No readings yet for %s between %s and %s - "
+                "meter may not have reported this period yet",
+                resource.classifier,
+                t_from,
+                t_to,
+            )
+            return None
         v = readings[0][1].value
         if len(readings) > 1:
             v += readings[1][1].value
