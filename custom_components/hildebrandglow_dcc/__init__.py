@@ -12,6 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import DOMAIN
+from .statistics import async_setup_statistics_import
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +40,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = glowmarkt
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Backfill 30-minute statistics, including any data that arrives late
+    unsub = await async_setup_statistics_import(hass, glowmarkt)
+    entry.async_on_unload(unsub)
 
     return True
 

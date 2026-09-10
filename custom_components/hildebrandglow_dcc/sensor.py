@@ -22,6 +22,7 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 from .const import DOMAIN
+from .helpers import async_get_resource_pairs
 
 _LOGGER = logging.getLogger(__name__)
 SCAN_INTERVAL = timedelta(minutes=5)
@@ -37,74 +38,34 @@ async def async_setup_entry(
     # Get API object from the config flow
     glowmarkt = hass.data[DOMAIN][entry.entry_id]
 
-    # Gather all virtual entities on the account
-    virtual_entities: dict = {}
-    try:
-        virtual_entities = await hass.async_add_executor_job(
-            glowmarkt.get_virtual_entities
-        )
-        _LOGGER.debug("Successful GET to %svirtualentity", glowmarkt.url)
-    except requests.Timeout as ex:
-        _LOGGER.error("Timeout: %s", ex)
-    except requests.exceptions.ConnectionError as ex:
-        _LOGGER.error("Cannot connect: %s", ex)
-    # Can't use the RuntimeError exception from the library as it's not a subclass of Exception
-    except Exception as ex:  # pylint: disable=broad-except
-        if "Request failed" in str(ex):
-            _LOGGER.error(
-                "Non-200 Status Code. The Glow API may be experiencing issues"
-            )
-        else:
-            _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
+    # Gather all resources across all virtual entities on the account
+    resource_pairs = await async_get_resource_pairs(hass, glowmarkt)
 
-    for virtual_entity in virtual_entities:
-        # Gather all resources for each virtual entity
-        resources: dict = {}
-        try:
-            resources = await hass.async_add_executor_job(virtual_entity.get_resources)
-            _LOGGER.debug(
-                "Successful GET to %svirtualentity/%s/resources",
-                glowmarkt.url,
-                virtual_entity.id,
-            )
-        except requests.Timeout as ex:
-            _LOGGER.error("Timeout: %s", ex)
-        except requests.exceptions.ConnectionError as ex:
-            _LOGGER.error("Cannot connect: %s", ex)
-        # Can't use the RuntimeError exception from the library as it's not a subclass of Exception
-        except Exception as ex:  # pylint: disable=broad-except
-            if "Request failed" in str(ex):
-                _LOGGER.error(
-                    "Non-200 Status Code. The Glow API may be experiencing issues"
-                )
-            else:
-                _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
+    # Loop through all resources and create sensors
+    for resource, virtual_entity in resource_pairs:
+        if resource.classifier in ["electricity.consumption", "gas.consumption"]:
+            usage_sensor = Usage(hass, resource, virtual_entity)
+            entities.append(usage_sensor)
+            # Save the usage sensor as a meter so that the cost sensor can reference it
+            meters[resource.classifier] = usage_sensor
 
-        # Loop through all resources and create sensors
-        for resource in resources:
-            if resource.classifier in ["electricity.consumption", "gas.consumption"]:
-                usage_sensor = Usage(hass, resource, virtual_entity)
-                entities.append(usage_sensor)
-                # Save the usage sensor as a meter so that the cost sensor can reference it
-                meters[resource.classifier] = usage_sensor
+            # Standing and Rate sensors are handled by the coordinator
+            coordinator = TariffCoordinator(hass, resource)
+            standing_sensor = Standing(coordinator, resource, virtual_entity)
+            entities.append(standing_sensor)
+            rate_sensor = Rate(coordinator, resource, virtual_entity)
+            entities.append(rate_sensor)
 
-                # Standing and Rate sensors are handled by the coordinator
-                coordinator = TariffCoordinator(hass, resource)
-                standing_sensor = Standing(coordinator, resource, virtual_entity)
-                entities.append(standing_sensor)
-                rate_sensor = Rate(coordinator, resource, virtual_entity)
-                entities.append(rate_sensor)
-
-        # Cost sensors must be created after usage sensors as they reference them as a meter
-        for resource in resources:
-            if resource.classifier == "gas.consumption.cost":
-                cost_sensor = Cost(hass, resource, virtual_entity)
-                cost_sensor.meter = meters["gas.consumption"]
-                entities.append(cost_sensor)
-            elif resource.classifier == "electricity.consumption.cost":
-                cost_sensor = Cost(hass, resource, virtual_entity)
-                cost_sensor.meter = meters["electricity.consumption"]
-                entities.append(cost_sensor)
+    # Cost sensors must be created after usage sensors as they reference them as a meter
+    for resource, virtual_entity in resource_pairs:
+        if resource.classifier == "gas.consumption.cost":
+            cost_sensor = Cost(hass, resource, virtual_entity)
+            cost_sensor.meter = meters["gas.consumption"]
+            entities.append(cost_sensor)
+        elif resource.classifier == "electricity.consumption.cost":
+            cost_sensor = Cost(hass, resource, virtual_entity)
+            cost_sensor.meter = meters["electricity.consumption"]
+            entities.append(cost_sensor)
 
     # Get data for all entities on initial startup
     async_add_entities(entities, update_before_add=True)

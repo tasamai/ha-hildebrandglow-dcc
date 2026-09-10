@@ -1,6 +1,9 @@
 {
   "domain": "hildebrandglow_dcc",
   "name": "Hildebrand Glow (DCC)",
+  "after_dependencies": [
+    "recorder"
+  ],
   "codeowners": [
     "@HandyHat"
   ],
