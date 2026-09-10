@@ -138,30 +138,17 @@ async def _async_fetch_half_hourly(hass: HomeAssistant, resource, t_from, t_to):
     # Can't use the RuntimeError exception from the library as it's not a subclass of Exception
     except Exception as ex:  # pylint: disable=broad-except
         if "Request failed" in str(ex):
-            _LOGGER.debug("Catchup exception detail: %s", ex)
             _LOGGER.warning(
-                "Non-200 Status Code on catchup. The Glow API may be experiencing "
-                "issues"
+                "Non-200 Status Code on catchup for %s: %s",
+                resource.classifier,
+                ex,
             )
         else:
             _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
 
     try:
-        _LOGGER.debug(
-            "Get half-hourly readings from %s to %s for %s",
-            t_from,
-            t_to,
-            resource.classifier,
-        )
         readings = await hass.async_add_executor_job(
             resource.get_readings, t_from, t_to, "PT30M", "sum", True
-        )
-        _LOGGER.debug(
-            "Got %s half-hourly readings for %s between %s and %s",
-            len(readings),
-            resource.classifier,
-            t_from,
-            t_to,
         )
         return readings
     except requests.Timeout as ex:
@@ -171,9 +158,13 @@ async def _async_fetch_half_hourly(hass: HomeAssistant, resource, t_from, t_to):
     # Can't use the RuntimeError exception from the library as it's not a subclass of Exception
     except Exception as ex:  # pylint: disable=broad-except
         if "Request failed" in str(ex):
-            _LOGGER.debug("Readings exception detail: %s", ex)
             _LOGGER.warning(
-                "Non-200 Status Code. The Glow API may be experiencing issues"
+                "Non-200 Status Code fetching half-hourly readings for %s "
+                "(from %s to %s): %s",
+                resource.classifier,
+                t_from,
+                t_to,
+                ex,
             )
         else:
             _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
